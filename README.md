@@ -8,7 +8,6 @@ Production-ready FastAPI backend for RAG-based legal case search with Qdrant vec
 - Vector embeddings with OpenAI or open-source models
 - Semantic search via Qdrant vector database
 - RAG-based question answering with LLM integration
-- Background task support for batch ingestion
 - Comprehensive error handling and logging
 
 ## Quick Start
@@ -75,7 +74,7 @@ API will be available at `http://localhost:8000`
 
 ### Document Management
 - `POST /upload` - Upload legal documents
-- `GET /list_documents` - List all documents
+- `GET /documents?user_id=your_user_id` - List all documents for a user
 
 ### Search
 - `GET /search?query=your_query&top_k=5&threshold=0.4` - Semantic search

@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 
-from app.routers import upload, search, ask, health
+from app.routers import upload, search, health
 from app.config import settings
 from app.services.qdrant_service import QdrantService
 
