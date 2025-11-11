@@ -18,6 +18,8 @@ class SearchResult(BaseModel):
     similarity_score: float
     title: str
     summary: str
+    short_description_html: Optional[str] = None
+    summary_html: Optional[str] = None
 
 class SearchResponse(BaseModel):
     """Search response"""

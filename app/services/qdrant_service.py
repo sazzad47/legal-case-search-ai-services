@@ -169,7 +169,7 @@ class QdrantService:
             async def _delete():
                 return await self.client.delete(
                     collection_name=collection_name,
-                    points_selector={"filter": Filter(must=conditions)}
+                    points_selector=Filter(must=conditions)
                 )
             await retry_async(_delete, retries=2)
             logger.info(f"Deleted all chunks for document {doc_id}")

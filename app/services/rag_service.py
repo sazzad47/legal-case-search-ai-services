@@ -106,50 +106,30 @@ Answer:"""
             logger.warning(f"Query rephrase failed; using original. Error: {e}")
             return cleaned
 
-    def suggest_queries(self, seed: str = "", limit: int = 6) -> list:
-        """Suggest helpful search queries for legal research.
+    def suggest_queries(self, seed: str = "", limit: int = 6, documents_context: str | None = None, user_id: str | None = None) -> list:
+        """Suggest helpful search queries tailored to a specific user's uploaded documents.
 
-        - If OpenAI is available, generate suggestions tailored to the user's seed.
-        - Otherwise, return curated and heuristic suggestions.
+        - Requires OpenAI; returns an empty list when unavailable or on error.
+        - Uses the provided documents_context to guide query generation.
         """
         seed = (seed or "").strip()
 
-        # Fallback curated suggestions
-        base_suggestions = [
-            "breach of contract in retail",
-            "landlord liability for tenant injury",
-            "intellectual property disputes",
-            "employment discrimination cases",
-            "negligence in construction projects",
-            "consumer protection class actions",
-        ]
-
         if not self.use_openai:
-            # Simple heuristic expansion when seed is provided
-            if seed:
-                expansions = [
-                    f"case law on {seed}",
-                    f"precedents related to {seed}",
-                    f"{seed} recent judgments",
-                ]
-                suggestions = expansions + base_suggestions
-                # Deduplicate while preserving order
-                seen = set()
-                deduped = []
-                for s in suggestions:
-                    if s not in seen:
-                        seen.add(s)
-                        deduped.append(s)
-                return deduped[:limit]
-            return base_suggestions[:limit]
+            # No fallbacks; honor requirement for user-specific suggestions only
+            return []
 
         try:
             instruction = (
-                "Propose concise, diverse search queries for a legal case corpus. "
-                "Focus on topics, parties, liabilities, and common legal issues. "
+                "You are assisting with search over a specific user's uploaded legal documents. "
+                "Propose concise, diverse search queries that would be most effective for THIS corpus. "
+                "Use only the provided document context; avoid generic topics unrelated to it. "
                 "Return ONLY a JSON array of strings."
             )
-            user_prompt = seed if seed else "Generate general-purpose legal research queries."
+            user_prompt = (
+                (f"Seed: {seed}\n" if seed else "") +
+                (f"User ID: {user_id}\n" if user_id else "") +
+                (f"Documents:\n{documents_context}" if documents_context else "No document context provided.")
+            )
             messages = [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": user_prompt},
@@ -162,14 +142,14 @@ Answer:"""
             )
             content = response.choices[0].message.content
             import json
-            suggestions = base_suggestions
+            suggestions: list = []
             try:
                 parsed = json.loads(content)
                 if isinstance(parsed, list) and parsed:
-                    suggestions = parsed + base_suggestions
+                    suggestions = parsed
             except Exception:
-                # Keep fallback suggestions
-                pass
+                # No fallback suggestions
+                return []
             # Deduplicate and clip
             seen = set()
             result = []
@@ -182,8 +162,8 @@ Answer:"""
                     result.append(s)
             return result[:limit]
         except Exception as e:
-            logger.warning(f"Suggest queries failed; using fallback. Error: {e}")
-            return base_suggestions[:limit]
+            logger.warning(f"Suggest queries failed; returning empty list. Error: {e}")
+            return []
 
     def rerank_results(self, question: str, results: List[Dict], top_k: int) -> List[Dict]:
         """Optionally rerank retrieved chunks using LLM guidance, inspired by other-project.
@@ -292,7 +272,13 @@ Answer:"""
         text_context = "\n\n".join(chunks[:6]) if chunks else ""
 
         if not text_context:
-            return {"title": "No title", "summary": "No relevant content found."}
+            empty_html = "<p>No relevant content found.</p>"
+            return {
+                "title": "No title",
+                "summary": "No relevant content found.",
+                "short_description_html": empty_html,
+                "summary_html": empty_html,
+            }
 
         # Attempt to detect a case name and year from the text
         import re
@@ -308,46 +294,68 @@ Answer:"""
             detected_title = None
 
         if not self.use_openai:
-            # Heuristic fallback:
-            # - Title: prefer detected case name; else first meaningful sentence
-            # - Summary: two sentences -> issue/context + holding/rule
+            # Heuristic fallback producing paragraph-only HTML with basic highlights
             sentences = [s.strip() for s in re.split(r"[\.!?]\s+", text_context) if s.strip()]
             title = detected_title or (sentences[0][:80] if sentences else (chunks[0][:80]).strip())
 
             # Pick an issue/context sentence
             issue_sentence = None
             for s in sentences:
-                if any(k in s.lower() for k in ["case", "dispute", "conflict", "commerce", "permit", "law"]):
+                if any(k in s.lower() for k in ["case", "dispute", "conflict", "commerce", "permit", "law", "bridge", "contract", "constitution"]):
                     issue_sentence = s
                     break
 
             # Pick a holding/rule sentence
             holding_sentence = None
             for s in sentences:
-                if any(k in s.lower() for k in ["held", "ruled", "decided", "court", "supremacy clause", "interstate commerce"]):
+                if any(k in s.lower() for k in ["held", "ruled", "decided", "court", "declared", "struck", "void", "valid", "unconstitutional", "supremacy clause", "interstate commerce"]):
                     holding_sentence = s
                     break
 
+            fallback_summary_text = self._simple_summarize(query, chunks)
             parts = []
             if issue_sentence:
                 parts.append(issue_sentence)
             if holding_sentence and holding_sentence != issue_sentence:
                 parts.append(holding_sentence)
             if not parts:
-                parts.append(self._simple_summarize(query, chunks))
+                parts.append(fallback_summary_text)
 
-            summary = ". ".join([p.strip() for p in parts])
-            return {"title": title.strip(), "summary": summary.strip()}
+            summary_text = ". ".join([p.strip() for p in parts])
+
+            def mark_highlights(text: str, q: str) -> str:
+                try:
+                    if not q:
+                        return text
+                    # highlight key tokens from query
+                    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", q) if len(t) > 2]
+                    highlighted = text
+                    for t in set(tokens):
+                        highlighted = re.sub(rf"(?i)\b{re.escape(t)}\b", f"<mark>{t}</mark>", highlighted)
+                    return highlighted
+                except Exception:
+                    return text
+
+            short_description_html = f"<p>{mark_highlights(issue_sentence or (sentences[0] if sentences else fallback_summary_text), query)}</p>"
+            summary_html = f"<p>{mark_highlights(summary_text, query)}</p>"
+
+            return {
+                "title": title.strip(),
+                "summary": summary_text.strip(),
+                "short_description_html": short_description_html,
+                "summary_html": summary_html,
+            }
 
         try:
             instruction = (
-                "You are a legal research assistant. Create a concise card for UI. "
-                "Return ONLY a JSON object with keys 'title' and 'summary'. "
+                "You are a legal research assistant. Build a UI card in JSON. "
+                "Return ONLY JSON with keys: 'title', 'short_description_html', 'summary_html'. "
                 "If a case name is provided, use it verbatim in 'title'. "
                 "Title: 6–12 words, include year if available. "
-                "Summary: EXACTLY 2 sentences under 240 characters total: "
-                "(1) brief issue/context, (2) holding + controlling doctrine. "
-                "Avoid quotes, disclaimers, and citation artifacts; use plain legal English."
+                "short_description_html: ONE crisp sentence (<p>...</p>) summarizing the issue/context, 20–40 words. "
+                "summary_html: ONE compact paragraph (<p>...</p>) focusing on highlights and context relevant to the query. "
+                "Include highlights with <mark> for key entities, year, doctrines, and holdings. "
+                "No lists or bullets. Use plain legal English, no citations or disclaimers, and valid HTML only."
             )
             user_payload = (
                 (f"Detected case: {detected_title}\n" if detected_title else "") +
@@ -364,19 +372,46 @@ Answer:"""
                 max_tokens=220,
             )
             content = response.choices[0].message.content
-            import json
+            import json, re
             try:
                 parsed = json.loads(content)
                 title = (parsed.get("title") or detected_title or "Untitled").strip()
-                summary = (parsed.get("summary") or "").strip()
-                # Basic cleanup
-                summary = summary.replace("\n", " ").strip()
-                return {"title": title, "summary": summary}
+                short_description_html = (parsed.get("short_description_html") or "").strip()
+                summary_html = (parsed.get("summary_html") or "").strip()
+                # sanitize: remove list tags, ensure paragraph wrapper
+                def ensure_paragraph(html: str) -> str:
+                    try:
+                        clean = re.sub(r"</?ul[^>]*>|</?li[^>]*>", " ", html or "")
+                        clean = clean.strip()
+                        if not clean:
+                            return "<p></p>"
+                        if not clean.lower().startswith("<p>"):
+                            clean = f"<p>{clean}</p>"
+                        return clean
+                    except Exception:
+                        return f"<p>{html or ''}</p>"
+                short_description_html = ensure_paragraph(short_description_html)
+                summary_html = ensure_paragraph(summary_html)
+                # Derive a plain-text summary for backward compatibility
+                summary_text = re.sub(r"<[^>]+>", " ", summary_html).replace("\n", " ").strip()
+                return {
+                    "title": title,
+                    "summary": summary_text,
+                    "short_description_html": short_description_html,
+                    "summary_html": summary_html,
+                }
             except Exception:
                 # Fallback to heuristic
                 title = detected_title or (chunks[0][:80]).strip()
-                summary = self._simple_summarize(query, chunks)
-                return {"title": title, "summary": summary}
+                summary_text = self._simple_summarize(query, chunks)
+                short_description_html = f"<p>{summary_text}</p>"
+                summary_html = f"<p>{summary_text}</p>"
+                return {
+                    "title": title,
+                    "summary": summary_text,
+                    "short_description_html": short_description_html,
+                    "summary_html": summary_html,
+                }
         except Exception as e:
             logger.warning(f"Card generation failed; using fallback: {e}")
             title = detected_title or (chunks[0][:80]).strip()
