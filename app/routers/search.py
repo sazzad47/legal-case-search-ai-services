@@ -24,15 +24,19 @@ async def search_post(payload: SearchRequest):
     try:
         start_time = time()
 
-        # Optional rephrase
-        effective_query = rag_service.rephrase_query(payload.query) if getattr(payload, "rephrase", True) else payload.query
+        # Optional rephrase: disable when threshold is very high (favor exact phrasing)
+        threshold_val = float(getattr(payload, "threshold", 0.0) or 0.0)
+        should_rephrase = getattr(payload, "rephrase", True) and threshold_val < 0.95
+        effective_query = rag_service.rephrase_query(payload.query) if should_rephrase else payload.query
 
         query_embedding = embed_service.embed(effective_query)
         await qdrant_service.initialize()
+        # Clamp threshold to realistic cosine similarity range (< 1.0)
+        effective_threshold = min(max(threshold_val, 0.0), 0.999)
         results = await qdrant_service.search(
             query_embedding,
             payload.top_k,
-            payload.threshold,
+            effective_threshold,
             user_id=getattr(payload, "user_id", None),
         )
 
@@ -58,11 +62,8 @@ async def search_post(payload: SearchRequest):
         search_results = []
         for doc_id, g in grouped.items():
             card = rag_service.build_result_card(payload.query, g["chunks"])
-            summary = card.get("summary", "")
-            # Truncate summary for UI preview
-            max_len = 240
-            if len(summary) > max_len:
-                summary = summary[:max_len].rstrip() + "…"
+            # No plain text summary needed in search results
+            summary = ""
             search_results.append(
                 SearchResult(
                     doc_id=doc_id,
@@ -70,8 +71,19 @@ async def search_post(payload: SearchRequest):
                     similarity_score=g.get("best_score", 0.0),
                     title=card.get("title", "Untitled"),
                     summary=summary,
+                    short_description_html=card.get("short_description_html"),
+                    summary_html=card.get("summary_html"),
                 )
             )
+
+        # Fallback to doc_id as key when source is missing
+        dedup_map = {}
+        for r in search_results:
+            key = (r.source or "").strip().lower() or r.doc_id
+            existing = dedup_map.get(key)
+            if not existing or float(r.similarity_score) > float(existing.similarity_score):
+                dedup_map[key] = r
+        search_results = list(dedup_map.values())
 
         # Sort results by relevance or source
         sort_by = getattr(payload, "sort_by", "relevance")
@@ -95,24 +107,30 @@ async def search_post(payload: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/search/suggestions")
-async def search_suggestions(q: str = "", limit: int = 6):
-    """Return AI-powered query suggestions.
+async def search_suggestions(user_id: str, q: str = "", limit: int = 6):
+    """Return AI-powered query suggestions specific to the given user_id.
 
-    - If `q` is provided, tailor suggestions to that seed.
-    - Falls back to curated suggestions when AI is unavailable.
+    Tailors suggestions to the user's uploaded documents. No generic fallbacks.
     """
     try:
-        suggestions = rag_service.suggest_queries(q, limit)
+        await qdrant_service.initialize()
+        docs = await qdrant_service.list_documents_by_user(user_id)
+
+        # Build lightweight context from user's documents
+        doc_lines = []
+        for d in docs[:10]:  # cap for prompt brevity
+            name = d.get("filename", "unknown")
+            ftype = d.get("file_type", "")
+            num = d.get("num_chunks", 0)
+            doc_lines.append(f"- {name} ({ftype}, chunks: {num})")
+        documents_context = "\n".join(doc_lines)
+
+        suggestions = rag_service.suggest_queries(q, limit, documents_context=documents_context, user_id=user_id)
         return SearchSuggestionsResponse(suggestions=suggestions)
     except Exception as e:
         logger.error(f"Search suggestions error: {e}")
-        # Conservative fallback
-        return SearchSuggestionsResponse(suggestions=[
-            "breach of contract in retail",
-            "landlord liability for tenant injury",
-            "intellectual property disputes",
-            "employment discrimination cases",
-        ][:limit])
+        # No fallback suggestions; return empty list
+        return SearchSuggestionsResponse(suggestions=[])
 
 @router.get("/case/{doc_id}")
 async def get_case_card(doc_id: str, user_id: Optional[str] = None, query: str = ""):
